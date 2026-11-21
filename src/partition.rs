@@ -123,6 +123,7 @@ impl ShopperKey {
 }
 
 struct Claim<T, S> {
+    lane: u8,
     id: EventId,
     ingested: Ingest,
     event: Event<T, S, ShopperKey>,
@@ -309,13 +310,18 @@ pub fn partition<'a, T: Stamp, S: Sale>(
         .div_ceil(768 * 1024)
         .clamp(8, 4096)
         .next_power_of_two();
+    // Limit simultaneous write streams per parser. Workers split each coarse
+    // bucket into the original event-ID shards before selecting winners.
+    let coarse_shards = event_shards.min(64);
+    let fine_shards = event_shards / coarse_shards;
+    let fine_bits = fine_shards.trailing_zeros();
     let shopper_shards = (workers * 4).next_power_of_two().max(8);
     let per_batch = batch_size(chunks.len(), workers);
     let batches: Vec<_> = chunks
         .into_par_iter()
         .chunks(per_batch)
         .map(|group| {
-            let mut claims = buckets(event_shards);
+            let mut claims = buckets(coarse_shards);
             let mut spill = Spill::default();
             let mut long_shoppers = HashTable::new();
             let mut extended = Vec::new();
@@ -334,7 +340,9 @@ pub fn partition<'a, T: Stamp, S: Sale>(
                         return;
                     };
                     let (id, shard) = EventId::partition(raw_id, &mut spill, event_shards);
-                    claims[shard].push(Claim {
+                    let coarse = shard >> fine_bits;
+                    claims[coarse].push(Claim {
+                        lane: (shard & (fine_shards - 1)) as u8,
                         id,
                         ingested: Ingest::encode(ingested, base, &mut extended),
                         event,
@@ -350,7 +358,7 @@ pub fn partition<'a, T: Stamp, S: Sale>(
         .collect::<Result<_>>()?;
 
     let mut sources = Vec::with_capacity(batches.len());
-    let mut shards = buckets(event_shards);
+    let mut shards = buckets(coarse_shards);
     for (source, batch) in batches.into_iter().enumerate() {
         sources.push(Source {
             spill: batch.spill,
@@ -366,12 +374,18 @@ pub fn partition<'a, T: Stamp, S: Sale>(
     // This bounds the number of dictionaries to merge after resolving winners.
     let winners: Vec<_> = shards
         .into_par_iter()
-        .chunks(batch_size(event_shards, workers))
+        .chunks(batch_size(coarse_shards, workers))
         .map(|group| {
             let mut names = Names::default();
             let mut events = Vec::new();
             for parts in group {
-                deduplicate(parts, &sources, dimensions, base, &mut names, &mut events);
+                if fine_shards == 1 {
+                    deduplicate(parts, &sources, dimensions, base, &mut names, &mut events);
+                } else {
+                    for lane in split_claim_parts(parts, fine_shards) {
+                        deduplicate(lane, &sources, dimensions, base, &mut names, &mut events);
+                    }
+                }
             }
             (names, events)
         })
@@ -449,6 +463,38 @@ pub fn partition<'a, T: Stamp, S: Sale>(
         names[linked as usize + index as usize] = Cow::Owned(name.into_vec());
     }
     Ok((partitions, names))
+}
+
+// Count each lane before allocating so a complete per-source row vector
+// is written once. The order of sources and the order within each source
+// are significant when two copies have equal ingest times.
+fn split_claim_parts<T, S>(
+    parts: Vec<ClaimPart<T, S>>,
+    fine_shards: usize,
+) -> Vec<Vec<ClaimPart<T, S>>> {
+    let mut lanes = buckets(fine_shards);
+    for part in parts {
+        let mut sizes = [0usize; 64];
+        for row in &part.rows {
+            sizes[usize::from(row.lane)] += 1;
+        }
+        let mut rows: Vec<Vec<_>> = sizes[..fine_shards]
+            .iter()
+            .map(|&count| Vec::with_capacity(count))
+            .collect();
+        for row in part.rows {
+            rows[usize::from(row.lane)].push(row);
+        }
+        for (lane, rows) in lanes.iter_mut().zip(rows) {
+            if !rows.is_empty() {
+                lane.push(ClaimPart {
+                    source: part.source,
+                    rows,
+                });
+            }
+        }
+    }
+    lanes
 }
 
 #[derive(Clone, Copy)]
@@ -695,6 +741,50 @@ mod tests {
             let (id, _) = EventId::partition(raw, &mut spill, 128);
             assert_eq!(spill.get(id), raw);
         }
+    }
+
+    #[test]
+    fn coarse_split_preserves_source_and_tie_order() {
+        use super::{ClaimPart, split_claim_parts};
+        let rows = |source, ids: &[(u64, u8)]| ClaimPart {
+            source,
+            rows: ids
+                .iter()
+                .map(|&(id, lane)| Claim {
+                    id: EventId(id),
+                    lane,
+                    ingested: Ingest(0),
+                    event: Event::<u32, u32, ShopperKey>::default(),
+                })
+                .collect(),
+        };
+        let parts = vec![
+            rows(1, &[(9, 3), (6, 1), (4, 3)]),
+            rows(5, &[(8, 1), (9, 3)]),
+        ];
+        let shape: Vec<Vec<_>> = split_claim_parts(parts, 4)
+            .into_iter()
+            .map(|parts| {
+                parts
+                    .into_iter()
+                    .map(|part| {
+                        (
+                            part.source,
+                            part.rows.into_iter().map(|r| r.id.0).collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                vec![],
+                vec![(1, vec![6]), (5, vec![8])],
+                vec![],
+                vec![(1, vec![9, 4]), (5, vec![9])]
+            ]
+        );
     }
 
     #[test]
