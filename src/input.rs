@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::names::{InlineId, NameMap};
+use crate::names::LinkedNames;
 use anyhow::{Context, Result, ensure};
 use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
@@ -392,7 +392,32 @@ unsafe fn visit_rows_avx2<'a, const N: usize>(
     }
 }
 
+// Parse eight checked ASCII digits in parallel: adjacent pairs, groups
+// of four, then the complete eight-digit number.
+#[inline]
+fn eight_digits(bytes: [u8; 8]) -> Option<u32> {
+    let word = u64::from_le_bytes(bytes);
+    // Adding 0x46 sets the high bit starting at ':'. Subtracting '0'
+    // sets it below '0'. An original high bit always rejects the byte.
+    let high = (word
+        | word.wrapping_add(0x4646_4646_4646_4646)
+        | word.wrapping_sub(0x3030_3030_3030_3030))
+        & 0x8080_8080_8080_8080;
+    if high != 0 {
+        return None;
+    }
+    let digits = word & 0x0f0f_0f0f_0f0f_0f0f;
+    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    Some((quads as u32) * 10_000 + (quads >> 32) as u32)
+}
+
 pub fn digits(s: &[u8]) -> Option<i64> {
+    if let &[a, b, c, d, e, f, g, h, i, j, k, l, m] = s {
+        let first = eight_digits([a, b, c, d, e, f, g, h])?;
+        let last = eight_digits([b'0', b'0', b'0', i, j, k, l, m])?;
+        return Some(i64::from(first) * 100_000 + i64::from(last));
+    }
     if s.is_empty() {
         return None;
     }
@@ -505,87 +530,90 @@ impl Timestamps {
     }
 }
 
-#[derive(Default)]
-struct Components {
-    parents: Vec<usize>,
-    sizes: Vec<usize>,
+struct Node<'a> {
+    parent: u32,
+    size: u32,
+    minimum: Id<'a>,
 }
 
-impl Components {
-    fn add(&mut self) -> usize {
-        let id = self.parents.len();
-        self.parents.push(id);
-        self.sizes.push(1);
+#[derive(Default)]
+struct Components<'a>(Vec<Node<'a>>);
+
+impl<'a> Components<'a> {
+    fn add(&mut self, name: Id<'a>) -> u32 {
+        let id = u32::try_from(self.0.len()).expect("alias index overflow");
+        self.0.push(Node {
+            parent: id,
+            size: 1,
+            minimum: name,
+        });
         id
     }
 
-    fn root(&mut self, mut id: usize) -> usize {
-        while self.parents[id] != id {
-            self.parents[id] = self.parents[self.parents[id]];
-            id = self.parents[id];
+    fn root(&mut self, mut id: u32) -> u32 {
+        while self.0[id as usize].parent != id {
+            let parent = self.0[id as usize].parent;
+            let grandparent = self.0[parent as usize].parent;
+            self.0[id as usize].parent = grandparent;
+            id = grandparent;
         }
         id
     }
 
-    fn unite(&mut self, a: usize, b: usize) {
+    fn unite(&mut self, a: u32, b: u32) {
         let (mut left, mut right) = (self.root(a), self.root(b));
         if left == right {
             return;
         }
-        if self.sizes[left] < self.sizes[right] {
+        if self.0[left as usize].size < self.0[right as usize].size {
             std::mem::swap(&mut left, &mut right);
         }
-        self.parents[right] = left;
-        self.sizes[left] += self.sizes[right];
+        self.0[right as usize].parent = left;
+        let right = &self.0[right as usize];
+        let (size, minimum) = (right.size, right.minimum);
+        let left = &mut self.0[left as usize];
+        left.size += size;
+        left.minimum = left.minimum.min(minimum);
     }
 }
 
 pub struct LinkedPeople<'a> {
-    pub aliases: NameMap<Id<'a>>,
+    pub aliases: LinkedNames<'a>,
     pub names: Vec<Id<'a>>,
 }
 
 fn linked_people(files: &[Mmap]) -> LinkedPeople<'_> {
-    let mut ids = FxHashMap::default();
+    let mut aliases = LinkedNames::default();
     let mut components = Components::default();
     for file in files {
         for [a, b] in lines(body(file)).filter_map(fields::<2>) {
-            if !a.is_empty() && !b.is_empty() {
-                let a = *ids.entry(a).or_insert_with(|| components.add());
-                let b = *ids.entry(b).or_insert_with(|| components.add());
-                components.unite(a, b);
+            if a.is_empty() || b.is_empty() {
+                continue;
             }
+            let left = aliases.intern(a, || components.add(a));
+            let right = aliases.intern(b, || components.add(b));
+            components.unite(left, right);
         }
     }
 
-    let mut names: Vec<Id<'_>> = vec![&[]; ids.len()];
-    for (&alias, &id) in &ids {
-        let root = components.root(id);
-        if names[root].is_empty() || alias < names[root] {
-            names[root] = alias;
-        }
-    }
-    let mut numbers = vec![0; ids.len()];
-    let mut canonical = Vec::new();
-    for (root, name) in names.into_iter().enumerate() {
-        if !name.is_empty() {
-            numbers[root] = u32::try_from(canonical.len()).expect("shopper index overflow");
-            canonical.push(name);
-        }
-    }
-    let mut aliases = NameMap::default();
-    for (alias, id) in ids {
-        let number = numbers[components.root(id)];
-        if let Some(key) = InlineId::new(alias) {
-            aliases.short.insert(key, number);
-        } else {
-            aliases.other.insert(alias, number);
-        }
-    }
-    LinkedPeople {
-        aliases,
-        names: canonical,
-    }
+    let mut names = Vec::new();
+    let root_numbers: Vec<u32> = components
+        .0
+        .iter()
+        .enumerate()
+        .map(|(id, node)| {
+            if node.parent as usize != id {
+                return 0;
+            }
+            let number = u32::try_from(names.len()).expect("shopper index overflow");
+            names.push(node.minimum);
+            number
+        })
+        .collect();
+    // The key tables already have the layout used by the event and click readers.
+    // Replace each union-find index in place once all links are known.
+    aliases.remap(|id| root_numbers[components.root(id) as usize]);
+    LinkedPeople { aliases, names }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -620,6 +648,21 @@ mod tests {
 #[cfg(test)]
 mod ingestion_tests {
     use super::{Timestamps, fields_generic, lines, visit_rows};
+
+    #[test]
+    fn thirteen_digit_fast_path_matches_checked_decimal() {
+        let raw = *b"1791071890123";
+        for pos in 0..raw.len() {
+            for ch in 0..=u8::MAX {
+                let mut value = raw;
+                value[pos] = ch;
+                let expected = value.iter().try_fold(0i64, |n, &c| {
+                    c.is_ascii_digit().then(|| n * 10 + i64::from(c - b'0'))
+                });
+                assert_eq!(super::digits(&value), expected);
+            }
+        }
+    }
 
     #[test]
     fn batch_parser_matches_field_rules_across_vectors_and_tail() {

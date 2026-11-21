@@ -72,6 +72,149 @@ impl<K: Borrow<[u8]> + Eq + Hash> NameMap<K> {
     }
 }
 
+// Five short aliases and their canonical shopper numbers fit in one cache line.
+// InlineId reserves the high bit, so every valid key differs from EMPTY_KEY.
+const EMPTY_KEY: u64 = u64::MAX;
+const BUCKET_WIDTH: usize = 5;
+
+#[repr(C, align(64))]
+#[derive(Clone)]
+struct AliasBucket {
+    keys: [u64; BUCKET_WIDTH],
+    people: [u32; BUCKET_WIDTH],
+}
+
+impl Default for AliasBucket {
+    fn default() -> Self {
+        Self {
+            keys: [EMPTY_KEY; BUCKET_WIDTH],
+            people: [0; BUCKET_WIDTH],
+        }
+    }
+}
+
+impl AliasBucket {
+    fn is_full(&self) -> bool {
+        self.keys[BUCKET_WIDTH - 1] != EMPTY_KEY
+    }
+
+    fn insert(&mut self, key: InlineId, person: u32) {
+        let slot = self
+            .keys
+            .iter()
+            .position(|&stored| stored == EMPTY_KEY)
+            .unwrap();
+        self.keys[slot] = key.0;
+        self.people[slot] = person;
+    }
+}
+
+pub struct LinkedNames<'a> {
+    buckets: Vec<AliasBucket>,
+    short_count: usize,
+    other: FxHashMap<&'a [u8], u32>,
+}
+
+impl Default for LinkedNames<'_> {
+    fn default() -> Self {
+        Self {
+            buckets: vec![AliasBucket::default()],
+            short_count: 0,
+            other: FxHashMap::default(),
+        }
+    }
+}
+
+impl<'a> LinkedNames<'a> {
+    #[inline]
+    fn bucket(&self, key: InlineId) -> usize {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(key) as usize & (self.buckets.len() - 1)
+    }
+
+    // Return the stored number, or the first bucket with room for this key.
+    #[inline]
+    fn probe(&self, key: InlineId) -> Result<u32, usize> {
+        let mut index = self.bucket(key);
+        loop {
+            let bucket = &self.buckets[index];
+            for (&stored, &person) in bucket.keys.iter().zip(&bucket.people) {
+                if stored == key.0 {
+                    return Ok(person);
+                }
+            }
+            if !bucket.is_full() {
+                return Err(index);
+            }
+            index = (index + 1) & (self.buckets.len() - 1);
+        }
+    }
+
+    fn grow(&mut self) {
+        let count = self
+            .buckets
+            .len()
+            .checked_mul(2)
+            .expect("alias table overflow");
+        let old = std::mem::replace(&mut self.buckets, vec![AliasBucket::default(); count]);
+        for bucket in old {
+            for (key, person) in bucket.keys.into_iter().zip(bucket.people) {
+                if key == EMPTY_KEY {
+                    break;
+                }
+                let key = InlineId(key);
+                let mut index = self.bucket(key);
+                while self.buckets[index].is_full() {
+                    index = (index + 1) & (count - 1);
+                }
+                self.buckets[index].insert(key, person);
+            }
+        }
+    }
+
+    pub fn intern(&mut self, name: &'a [u8], add: impl FnOnce() -> u32) -> u32 {
+        let Some(key) = InlineId::new(name) else {
+            return *self.other.entry(name).or_insert_with(add);
+        };
+        let mut index = match self.probe(key) {
+            Ok(person) => return person,
+            Err(index) => index,
+        };
+        // At most four entries per five-slot bucket on average. A probe for a
+        // missing name always reaches an empty slot, including during growth.
+        if self.short_count == self.buckets.len() * (BUCKET_WIDTH - 1) {
+            self.grow();
+            index = self.probe(key).unwrap_err();
+        }
+        let person = add();
+        self.buckets[index].insert(key, person);
+        self.short_count += 1;
+        person
+    }
+
+    pub fn remap(&mut self, mut resolve: impl FnMut(u32) -> u32) {
+        for bucket in &mut self.buckets {
+            for (&key, person) in bucket.keys.iter().zip(&mut bucket.people) {
+                if key == EMPTY_KEY {
+                    break;
+                }
+                *person = resolve(*person);
+            }
+        }
+        for person in self.other.values_mut() {
+            *person = resolve(*person);
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, name: &[u8], short: Option<InlineId>) -> Option<u32> {
+        match short {
+            Some(key) => self.probe(key).ok(),
+            None => self.other.get(name).copied(),
+        }
+    }
+}
+
 impl NameMap<Box<[u8]>> {
     pub fn intern_short(&mut self, key: InlineId) -> u32 {
         let next = self.len();
@@ -123,5 +266,45 @@ mod tests {
             assert_eq!(InlineId::new(&raw[..n]).unwrap().bytes(), &raw[..n]);
         }
         assert!(InlineId::new(b"0123456789").is_none());
+    }
+
+    #[test]
+    fn linked_alias_lookup_survives_collisions_and_wraparound() {
+        use super::{InlineId, LinkedNames};
+        assert_eq!(size_of::<super::AliasBucket>(), 64);
+        assert_eq!(align_of::<super::AliasBucket>(), 64);
+        let words: Vec<_> = (0..4096).map(|i| format!("key{i:04}")).collect();
+        // Find nine names with the same final bucket in a four-bucket table.
+        let probe = LinkedNames {
+            buckets: vec![super::AliasBucket::default(); 4],
+            short_count: 0,
+            other: Default::default(),
+        };
+        let colliding: Vec<_> = words
+            .iter()
+            .filter(|name| probe.bucket(InlineId::new(name.as_bytes()).unwrap()) == 3)
+            .take(10)
+            .collect();
+        assert_eq!(colliding.len(), 10);
+        let mut table = LinkedNames::default();
+        for (i, name) in colliding[..9].iter().enumerate() {
+            assert_eq!(table.intern(name.as_bytes(), || i as u32), i as u32);
+            assert_eq!(
+                table.intern(name.as_bytes(), || panic!("duplicate insertion")),
+                i as u32
+            );
+        }
+        table.intern("é".as_bytes(), || 15);
+        table.remap(|id| id + 1);
+        for (i, name) in colliding[..9].iter().enumerate() {
+            assert_eq!(
+                table.get(name.as_bytes(), InlineId::new(name.as_bytes())),
+                Some(i as u32 + 1)
+            );
+        }
+        let absent = colliding[9].as_bytes();
+        assert_eq!(table.get(absent, InlineId::new(absent)), None);
+        assert_eq!(table.get("é".as_bytes(), None), Some(16));
+        assert_eq!(table.get(b"", InlineId::new(b"")), None);
     }
 }

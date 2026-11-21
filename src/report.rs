@@ -62,17 +62,19 @@ fn summarize<'a, T: Stamp, S: Sale>(
     shards: usize,
     base: i64,
 ) -> (Vec<UserDay<'a>>, CampaignDays) {
+    debug_assert!(shards.is_power_of_two());
+    let shard_bits = shards.trailing_zeros();
     let groups = people.div_ceil(shards);
     let mut events = group(
         partition.events,
         groups,
-        |row| row.person as usize / shards,
+        |row| row.person as usize >> shard_bits,
         |row| row.activity,
     );
     let mut clicks = group(
         partition.clicks,
         groups,
-        |row| row.person as usize / shards,
+        |row| row.person as usize >> shard_bits,
         |row| row,
     );
 
