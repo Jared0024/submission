@@ -1,11 +1,12 @@
-use std::hash::BuildHasher;
+use std::{borrow::Cow, hash::BuildHasher};
 
+use crate::names::{InlineId, NameMap};
 use anyhow::Result;
 use hashbrown::{HashTable, hash_table::Entry};
 use rayon::prelude::*;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::FxBuildHasher;
 
-use crate::input::{DAY_MS, Dimensions, Id, Input, digits, fields, lines, timestamp};
+use crate::input::{DAY_MS, Dimensions, Id, Input, Timestamps, digits, visit_rows};
 
 // A normal reporting window, including the click lookback, fits in 32 bits.
 // Wider manifests use the same pipeline with absolute 64-bit timestamps.
@@ -93,19 +94,6 @@ struct EventId(u64);
 impl EventId {
     const SPILL: u64 = 1 << 63;
 
-    // Nine nonzero ASCII bytes fit in 63 bits. Zero padding distinguishes
-    // prefixes. Other strings retain their exact bytes in the parse batch.
-    fn inline(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > 9 || !bytes.is_ascii() || bytes.contains(&0) {
-            return None;
-        }
-        let mut bits = 0;
-        for &b in bytes {
-            bits = (bits << 7) | u64::from(b);
-        }
-        Some(Self(bits << (7 * (9 - bytes.len()))))
-    }
-
     fn hash(self, spill: &Spill) -> u64 {
         if self.0 < Self::SPILL {
             FxBuildHasher.hash_one(self.0)
@@ -186,15 +174,13 @@ impl Spill {
     }
 }
 
-type Names = FxHashMap<Box<[u8]>, u32>;
+type Names = NameMap<Box<[u8]>>;
 
-fn name_index(names: &mut Names, id: &[u8]) -> u32 {
-    if let Some(&index) = names.get(id) {
-        return index;
-    }
-    let index = u32::try_from(names.len()).expect("shopper index overflow");
+// Linked shoppers have stable indices shared by every parser. Batch-local
+// unlinked indices follow that prefix until dedup routes the winning claim.
+fn unlinked_index(linked: u32, local: u32) -> u32 {
+    let index = linked.checked_add(local).expect("shopper index overflow");
     assert_ne!(index, INVALID, "shopper index overflow");
-    names.insert(id.into(), index);
     index
 }
 
@@ -222,7 +208,8 @@ pub fn partition<'a, T: Stamp, S: Sale>(
     dimensions: &Dimensions<'a>,
     workers: usize,
     base: i64,
-) -> Result<(Vec<ShopperPartition<'a, T, S>>, Vec<Box<[u8]>>)> {
+) -> Result<(Vec<ShopperPartition<'a, T, S>>, Vec<Cow<'a, [u8]>>)> {
+    let linked = u32::try_from(dimensions.people.names.len()).expect("shopper index overflow");
     let chunks = input.event_chunks()?;
     let bytes: usize = chunks.iter().map(|c| c.range.len()).sum();
     // Roughly 8K claims per event shard on the generator's CSV. The small
@@ -239,15 +226,17 @@ pub fn partition<'a, T: Stamp, S: Sale>(
             let mut names = Names::default();
             let mut spill = Spill::default();
             let mut extended = Vec::new();
+            let mut dates = Timestamps::default();
             for chunk in group {
-                let mapping = chunk.map()?;
-                for line in lines(&mapping) {
+                chunk.visit(|row| {
                     let Some((raw_id, ingested, event)) =
-                        parse_event(input, dimensions, &mut names, line, base)
+                        parse_event(input, dimensions, &mut names, &mut dates, row, base)
                     else {
-                        continue;
+                        return;
                     };
-                    let id = EventId::inline(raw_id).unwrap_or_else(|| spill.push(raw_id));
+                    let id = InlineId::new(raw_id)
+                        .map(|key| EventId(key.0))
+                        .unwrap_or_else(|| spill.push(raw_id));
                     // Use middle hash bits here. The table inside the shard uses
                     // the low bits for probing and the highest bits for tags.
                     let shard = (id.hash(&spill) >> 32) as usize & (event_shards - 1);
@@ -256,7 +245,7 @@ pub fn partition<'a, T: Stamp, S: Sale>(
                         ingested: Ingest::encode(ingested, base, &mut extended),
                         event,
                     });
-                }
+                })?;
             }
             Ok(Batch {
                 claims,
@@ -266,15 +255,18 @@ pub fn partition<'a, T: Stamp, S: Sale>(
             })
         })
         .collect::<Result<_>>()?;
+    drop(chunks);
 
     let mut people = Names::default();
     let mut sources = Vec::with_capacity(batches.len());
     let mut shards = buckets(event_shards);
     for (source, batch) in batches.into_iter().enumerate() {
         let mut translations = vec![0; batch.names.len()];
-        for (alias, local) in batch.names {
-            let canonical = dimensions.people.get(&*alias).copied().unwrap_or(&alias);
-            translations[local as usize] = name_index(&mut people, canonical);
+        for (key, local) in batch.names.short {
+            translations[local as usize] = unlinked_index(linked, people.intern_short(key));
+        }
+        for (alias, local) in batch.names.other {
+            translations[local as usize] = unlinked_index(linked, people.intern_other(&alias));
         }
         sources.push(Source {
             people: translations,
@@ -288,35 +280,57 @@ pub fn partition<'a, T: Stamp, S: Sale>(
         }
     }
 
-    let routed: Vec<_> = shards
-        .into_par_iter()
-        .map(|parts| deduplicate(parts, &sources, shopper_shards, base))
-        .collect();
-    drop(sources);
-    let click_chunks = input.click_chunks();
-    let clicks: Vec<_> = click_chunks
-        .par_chunks(batch_size(click_chunks.len(), workers))
-        .map(|group| {
-            let mut buckets = buckets(shopper_shards);
-            for chunk in group {
-                for click in lines(chunk)
-                    .filter_map(|row| parse_click(input, dimensions, &people, row, base))
-                {
-                    buckets[click.person as usize & (shopper_shards - 1)].push(click);
-                }
-            }
-            buckets
-        })
-        .collect();
+    // The alias table is complete. Click parsing and event deduplication can
+    // use the same pool independently, including when a shard finishes early.
+    let (routed, clicks) = rayon::join(
+        move || {
+            let routed: Vec<_> = shards
+                .into_par_iter()
+                .map(|parts| deduplicate(parts, &sources, shopper_shards, base, linked))
+                .collect();
+            drop(sources);
+            routed
+        },
+        || {
+            let click_chunks = input.click_chunks();
+            click_chunks
+                .par_chunks(batch_size(click_chunks.len(), workers))
+                .map(|group| {
+                    let mut buckets = buckets(shopper_shards);
+                    let mut dates = Timestamps::default();
+                    for chunk in group {
+                        visit_rows(chunk, |row| {
+                            if let Some(click) =
+                                parse_click(input, dimensions, &people, &mut dates, row, base)
+                            {
+                                buckets[click.person as usize & (shopper_shards - 1)].push(click);
+                            }
+                        });
+                    }
+                    buckets
+                })
+                .collect::<Vec<_>>()
+        },
+    );
 
     let partitions = transpose(routed, shopper_shards)
         .into_iter()
         .zip(transpose(clicks, shopper_shards))
         .map(|(events, clicks)| ShopperPartition { events, clicks })
         .collect();
-    let mut names = vec![Box::<[u8]>::default(); people.len()];
-    for (name, index) in people {
-        names[index as usize] = name;
+    let mut names: Vec<_> = dimensions
+        .people
+        .names
+        .iter()
+        .copied()
+        .map(Cow::Borrowed)
+        .collect();
+    names.resize(names.len() + people.len(), Cow::Borrowed(&[]));
+    for (key, index) in people.short {
+        names[linked as usize + index as usize] = Cow::Owned(key.bytes());
+    }
+    for (name, index) in people.other {
+        names[linked as usize + index as usize] = Cow::Owned(name.into_vec());
     }
     Ok((partitions, names))
 }
@@ -332,6 +346,7 @@ fn deduplicate<T: Stamp, S: Sale>(
     sources: &[Source],
     shopper_shards: usize,
     base: i64,
+    linked: u32,
 ) -> Vec<Vec<Event<T, S>>> {
     let count = parts.iter().map(|p| p.rows.len()).sum();
     let mut winners = HashTable::<Position>::with_capacity(count);
@@ -397,7 +412,9 @@ fn deduplicate<T: Stamp, S: Sale>(
         for claim in part.rows {
             let mut event = claim.event;
             if event.person != INVALID {
-                event.person = people[event.person as usize];
+                if event.person >= linked {
+                    event.person = people[(event.person - linked) as usize];
+                }
                 routed[event.person as usize & (shopper_shards - 1)].push(event);
             }
         }
@@ -429,19 +446,20 @@ fn parse_event<'a, T: Stamp, S: Sale>(
     input: &Input,
     dimensions: &Dimensions<'a>,
     names: &mut Names,
-    row: &'a [u8],
+    dates: &mut Timestamps,
+    row: [Id<'a>; 7],
     base: i64,
 ) -> Option<(Id<'a>, i64, Event<T, S>)> {
-    let [id, user, ts, ingest, kind, product, price] = fields(row)?;
+    let [id, user, ts, ingest, kind, product, price] = row;
     if id.is_empty() {
         return None;
     }
-    let ingested = timestamp(ingest)?;
+    let ingested = dates.parse(ingest)?;
     let event = (|| {
         if user.is_empty() || product.is_empty() {
             return None;
         }
-        let time = timestamp(ts)?;
+        let time = dates.parse(ts)?;
         if time < input.start || time >= input.end || ingested.saturating_sub(time) > DAY_MS {
             return None;
         }
@@ -461,7 +479,17 @@ fn parse_event<'a, T: Stamp, S: Sale>(
         } else {
             0
         };
-        let person = name_index(names, user);
+        let short = InlineId::new(user);
+        let person = dimensions
+            .people
+            .aliases
+            .get(user, short)
+            .unwrap_or_else(|| {
+                unlinked_index(
+                    dimensions.people.names.len() as u32,
+                    names.intern(user, short),
+                )
+            });
         Some(Event {
             person,
             activity: Activity {
@@ -481,19 +509,26 @@ fn parse_click<'a, T: Stamp>(
     input: &Input,
     dimensions: &Dimensions<'a>,
     people: &Names,
-    row: &'a [u8],
+    dates: &mut Timestamps,
+    row: [Id<'a>; 4],
     base: i64,
 ) -> Option<Click<'a, T>> {
-    let [id, user, campaign, ts] = fields(row)?;
+    let [id, user, campaign, ts] = row;
     if id.is_empty() || user.is_empty() {
         return None;
     }
-    let time = timestamp(ts)?;
+    let time = dates.parse(ts)?;
     if time < base || time >= input.end {
         return None;
     }
-    let name = dimensions.people.get(user).copied().unwrap_or(user);
-    let &person = people.get(name)?;
+    let short = InlineId::new(user);
+    let person = match dimensions.people.aliases.get(user, short) {
+        Some(linked) => linked,
+        None => unlinked_index(
+            dimensions.people.names.len() as u32,
+            people.get(user, short)?,
+        ),
+    };
     let &campaign = dimensions.campaigns.get(campaign)?;
     Some(Click {
         id,

@@ -2,10 +2,11 @@ use std::{
     fs::{self, File},
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+use crate::names::{InlineId, NameMap};
 use anyhow::{Context, Result, ensure};
-use chrono::NaiveDate;
 use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
 use rustc_hash::FxHashMap;
@@ -17,6 +18,7 @@ pub type Id<'a> = &'a [u8];
 
 pub struct Input {
     events: Vec<PathBuf>,
+    mapping_budget: u64,
     clicks: Vec<Mmap>,
     links: Vec<Mmap>,
     products: Option<Mmap>,
@@ -26,7 +28,7 @@ pub struct Input {
 }
 
 pub struct Dimensions<'a> {
-    pub people: FxHashMap<Id<'a>, Id<'a>>,
+    pub people: LinkedPeople<'a>,
     pub products: FxHashMap<Id<'a>, u32>,
     pub categories: Vec<Id<'a>>,
     pub campaigns: FxHashMap<Id<'a>, usize>,
@@ -34,18 +36,20 @@ pub struct Dimensions<'a> {
 }
 
 impl Input {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, mapping_budget: u64) -> Result<Self> {
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(path.join("manifest.json"))?)?;
-        let time = |key: &str| {
+        let mut dates = Timestamps::default();
+        let mut time = |key: &str| {
             manifest[key]
                 .as_str()
-                .and_then(|s| timestamp(s.as_bytes()))
+                .and_then(|s| dates.parse(s.as_bytes()))
                 .with_context(|| format!("invalid manifest field {key}"))
         };
         let (start, end) = (time("window_start")?, time("window_end")?);
         ensure!(start <= end, "the reporting window is reversed");
         Ok(Self {
+            mapping_budget,
             events: csv_paths(&path.join("events"))?,
             clicks: csv_files(&path.join("clicks"))?,
             links: csv_files(&path.join("links"))?,
@@ -58,13 +62,20 @@ impl Input {
 
     pub fn event_chunks(&self) -> Result<Vec<EventChunk<'_>>> {
         let mut chunks = Vec::new();
+        let mut budget = self.mapping_budget;
         for path in &self.events {
             if let Some(mapping) = map_file(path)? {
+                let mapping = Arc::new(mapping);
+                let shared = budget.checked_sub(mapping.len() as u64).map(|remaining| {
+                    budget = remaining;
+                    Arc::clone(&mapping)
+                });
                 let mut offset = mapping.len() - body(&mapping).len();
                 for bytes in split_chunks(&mapping[offset..]) {
                     let end = offset + bytes.len();
                     chunks.push(EventChunk {
                         path,
+                        shared: shared.clone(),
                         range: offset..end,
                     });
                     offset = end;
@@ -127,24 +138,31 @@ fn map_open(file: &File) -> Result<Option<Mmap>> {
     Ok(Some(unsafe { Mmap::map(file) }?))
 }
 
-// The planning pass touches only headers and chunk boundaries. Each parser
-// maps its own nonempty range and releases the mapping before its next chunk.
+// Files within the mapping budget share their planning map across parse tasks.
+// Other files are mapped one newline-aligned range at a time.
 pub struct EventChunk<'a> {
     path: &'a Path,
+    shared: Option<Arc<Mmap>>,
     pub range: Range<usize>,
 }
 
 impl EventChunk<'_> {
-    pub fn map(&self) -> Result<Mmap> {
+    pub fn visit<const N: usize>(&self, visit: impl FnMut([&[u8]; N])) -> Result<()> {
+        if let Some(mapping) = &self.shared {
+            visit_rows(&mapping[self.range.clone()], visit);
+            return Ok(());
+        }
         let file =
             File::open(self.path).with_context(|| format!("opening {}", self.path.display()))?;
         // The same read-only file supplied the boundaries above.
-        Ok(unsafe {
+        let mapping = unsafe {
             MmapOptions::new()
                 .offset(self.range.start as u64)
                 .len(self.range.len())
-                .map(&file)
-        }?)
+                .map(&file)?
+        };
+        visit_rows(&mapping, visit);
+        Ok(())
     }
 }
 
@@ -268,30 +286,110 @@ fn fields_masked<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         let offset = line.len() - 16;
         add(offset, line[offset..].try_into().unwrap());
     }
+    decode_fields(line, commas, quotes.count_ones())
+}
+
+// Every quote belongs to exactly one complete outer pair on a valid row.
+// Counting them also catches a stray or interior quote in any field.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn decode_fields<const N: usize>(line: &[u8], commas: u128, quotes: u32) -> Option<[&[u8]; N]> {
     if commas.count_ones() as usize + 1 != N {
         return None;
     }
+    if quotes == 0 {
+        split_fields::<N, false>(line, commas, quotes)
+    } else {
+        split_fields::<N, true>(line, commas, quotes)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn split_fields<const N: usize, const QUOTED: bool>(
+    line: &[u8],
+    mut commas: u128,
+    quotes: u32,
+) -> Option<[&[u8]; N]> {
     let mut values: [&[u8]; N] = [&[]; N];
     let mut start = 0;
-    for value in &mut values {
-        let end = if commas == 0 {
+    let mut paired = 0;
+    for (i, value) in values.iter_mut().enumerate() {
+        let end = if i + 1 == N {
             line.len()
         } else {
-            commas.trailing_zeros() as usize
+            let end = commas.trailing_zeros() as usize;
+            commas &= commas.wrapping_sub(1);
+            end
         };
-        commas &= commas.wrapping_sub(1);
-        if start < end && line[start] == b'"' {
-            if end - start < 2 || line[end - 1] != b'"' {
-                return None;
-            }
-            quotes &= !((1u128 << start) | (1u128 << (end - 1)));
-            *value = &line[start + 1..end - 1];
+        let raw = &line[start..end];
+        if QUOTED && raw.first() == Some(&b'"') {
+            *value = raw[1..].strip_suffix(b"\"")?;
+            paired += 2;
         } else {
-            *value = &line[start..end];
+            *value = raw;
         }
         start = end + 1;
     }
-    (quotes == 0).then_some(values)
+    (paired == quotes).then_some(values)
+}
+
+pub fn visit_rows<'a, const N: usize>(bytes: &'a [u8], mut visit: impl FnMut([&'a [u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("popcnt") {
+        // SAFETY: both features were detected before entering the specialized loop.
+        unsafe { visit_rows_avx2(bytes, visit) };
+        return;
+    }
+    for row in lines(bytes).filter_map(fields::<N>) {
+        visit(row);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn visit_rows_avx2<'a, const N: usize>(
+    mut bytes: &'a [u8],
+    mut visit: impl FnMut([&'a [u8]; N]),
+) {
+    use std::arch::x86_64::*;
+    // All four possible 32-byte loads are inside the slice. Finish a short
+    // tail with the general parser, including an unterminated final row.
+    while bytes.len() >= 128 {
+        let mut commas = 0u128;
+        let mut quotes = 0;
+        let mut end = None;
+        for block in 0..4 {
+            let offset = block * 32;
+            // SAFETY: offset is at most 96 and loadu has no alignment requirement.
+            let data = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast()) };
+            let mask =
+                |ch| _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8(ch))) as u32;
+            let newline = mask(b'\n' as i8);
+            let preceding = newline.wrapping_sub(1) & !newline;
+            commas |= u128::from(mask(b',' as i8) & preceding) << offset;
+            quotes += (mask(b'"' as i8) & preceding).count_ones();
+            if newline != 0 {
+                end = Some(offset + newline.trailing_zeros() as usize);
+                break;
+            }
+        }
+        if let Some(end) = end {
+            if let Some(row) = decode_fields(&bytes[..end], commas, quotes) {
+                visit(row);
+            }
+            bytes = &bytes[end + 1..];
+        } else {
+            let end = memchr(b'\n', &bytes[128..]).map_or(bytes.len(), |pos| 128 + pos);
+            if let Some(row) = fields_generic(&bytes[..end]) {
+                visit(row);
+            }
+            bytes = bytes.get(end + 1..).unwrap_or_default();
+        }
+    }
+    for row in lines(bytes).filter_map(fields::<N>) {
+        visit(row);
+    }
 }
 
 pub fn digits(s: &[u8]) -> Option<i64> {
@@ -304,42 +402,106 @@ pub fn digits(s: &[u8]) -> Option<i64> {
     })
 }
 
-pub fn timestamp(s: &[u8]) -> Option<i64> {
-    if !matches!(s.len(), 20 | 25) || s.get(10) != Some(&b'T') {
-        return digits(s);
+// The proleptic Gregorian calendar repeats every 400 years. Each entry is
+// the start of the next year measured from January 1, year 1 of the cycle.
+const YEAR_STARTS: [i32; 401] = {
+    let mut starts = [0; 401];
+    let mut year = 1;
+    while year <= 400 {
+        let leap = year % 4 == 0 && (year % 100 != 0 || year == 400);
+        starts[year] = starts[year - 1] + 365 + leap as i32;
+        year += 1;
     }
-    if s[4] != b'-' || s[7] != b'-' || s[13] != b':' || s[16] != b':' {
+    starts
+};
+
+const MONTH_STARTS: [[i32; 13]; 2] = [
+    [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365],
+    [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366],
+];
+
+const fn days_before_year(year: u32) -> i32 {
+    let years = year - 1;
+    (years / 400) as i32 * YEAR_STARTS[400] + YEAR_STARTS[(years % 400) as usize]
+}
+
+fn utc_midnight(year: u32, month: u32, day: u32) -> Option<i64> {
+    if year == 0 || !(1..=12).contains(&month) {
         return None;
     }
-    let year = digits(&s[..4])? as i32;
-    let month = digits(&s[5..7])? as u32;
-    let day = digits(&s[8..10])? as u32;
-    let first = digits(&s[11..13])? as u32;
-    let minute = digits(&s[14..16])? as u32;
-    let second = digits(&s[17..19])? as u32;
-    if year == 0 {
+    let y = ((year - 1) % 400) as usize;
+    let months = &MONTH_STARTS[(YEAR_STARTS[y + 1] - YEAR_STARTS[y] == 366) as usize];
+    let m = month as usize;
+    if day == 0 || day > (months[m] - months[m - 1]) as u32 {
         return None;
     }
-    let wall_time = NaiveDate::from_ymd_opt(year, month, day)?
-        .and_hms_opt(first, minute, second)?
-        .and_utc()
-        .timestamp_millis();
-    match &s[19..] {
-        b"Z" => Some(wall_time),
-        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] => {
-            let hours = digits(&[*h1, *h2])?;
-            let minutes = digits(&[*m1, *m2])?;
-            if hours > 23 || minutes > 59 {
-                return None;
-            }
-            let offset = (hours * 60 + minutes) * 60_000;
-            Some(if *sign == b'+' {
-                wall_time - offset
-            } else {
-                wall_time + offset
-            })
+    const EPOCH: i32 = days_before_year(1970);
+    let days = days_before_year(year) - EPOCH + months[m - 1] + day as i32 - 1;
+    Some(i64::from(days) * DAY_MS)
+}
+
+// Each parse batch caches validated UTC midnights. A full YYYYMMDD key
+// distinguishes months, years and invalid input even when the slot collides.
+pub struct Timestamps {
+    days: [(u64, i64); 32],
+}
+
+impl Default for Timestamps {
+    fn default() -> Self {
+        Self {
+            days: [(u64::from_le_bytes(*b"19700101"), 0); 32],
         }
-        _ => None,
+    }
+}
+
+fn pair(a: u8, b: u8) -> Option<u32> {
+    let tens = a.wrapping_sub(b'0');
+    let ones = b.wrapping_sub(b'0');
+    if tens > 9 || ones > 9 {
+        return None;
+    }
+    Some(u32::from(tens) * 10 + u32::from(ones))
+}
+
+impl Timestamps {
+    pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        if !matches!(s.len(), 20 | 25) || s[10] != b'T' {
+            return digits(s);
+        }
+        if s[4] != b'-' || s[7] != b'-' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+
+        let hour = pair(s[11], s[12])?;
+        let minute = pair(s[14], s[15])?;
+        let second = pair(s[17], s[18])?;
+        if hour >= 24 || minute >= 60 || second >= 60 {
+            return None;
+        }
+        let offset_minutes = match &s[19..] {
+            b"Z" => 0,
+            [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] => {
+                let hours = pair(*h1, *h2)?;
+                let minutes = pair(*m1, *m2)?;
+                if hours >= 24 || minutes >= 60 {
+                    return None;
+                }
+                let offset = i64::from(hours * 60 + minutes);
+                if *sign == b'+' { offset } else { -offset }
+            }
+            _ => return None,
+        };
+        let key = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[5], s[6], s[8], s[9]]);
+        let slot = &mut self.days[(usize::from(s[8]) * 10 + usize::from(s[9])) & 31];
+        if slot.0 != key {
+            let year = pair(s[0], s[1])? * 100 + pair(s[2], s[3])?;
+            *slot = (
+                key,
+                utc_midnight(year, pair(s[5], s[6])?, pair(s[8], s[9])?)?,
+            );
+        }
+        let seconds = i64::from(hour * 3600 + minute * 60 + second) - offset_minutes * 60;
+        Some(slot.1 + seconds * 1000)
     }
 }
 
@@ -378,7 +540,12 @@ impl Components {
     }
 }
 
-fn linked_people(files: &[Mmap]) -> FxHashMap<Id<'_>, Id<'_>> {
+pub struct LinkedPeople<'a> {
+    pub aliases: NameMap<Id<'a>>,
+    pub names: Vec<Id<'a>>,
+}
+
+fn linked_people(files: &[Mmap]) -> LinkedPeople<'_> {
     let mut ids = FxHashMap::default();
     let mut components = Components::default();
     for file in files {
@@ -398,9 +565,27 @@ fn linked_people(files: &[Mmap]) -> FxHashMap<Id<'_>, Id<'_>> {
             names[root] = alias;
         }
     }
-    ids.into_iter()
-        .map(|(alias, id)| (alias, names[components.root(id)]))
-        .collect()
+    let mut numbers = vec![0; ids.len()];
+    let mut canonical = Vec::new();
+    for (root, name) in names.into_iter().enumerate() {
+        if !name.is_empty() {
+            numbers[root] = u32::try_from(canonical.len()).expect("shopper index overflow");
+            canonical.push(name);
+        }
+    }
+    let mut aliases = NameMap::default();
+    for (alias, id) in ids {
+        let number = numbers[components.root(id)];
+        if let Some(key) = InlineId::new(alias) {
+            aliases.short.insert(key, number);
+        } else {
+            aliases.other.insert(alias, number);
+        }
+    }
+    LinkedPeople {
+        aliases,
+        names: canonical,
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -428,6 +613,79 @@ mod tests {
                 }
                 assert_eq!(fields::<2>(&line), fields_generic::<2>(&line));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ingestion_tests {
+    use super::{Timestamps, fields_generic, lines, visit_rows};
+
+    #[test]
+    fn batch_parser_matches_field_rules_across_vectors_and_tail() {
+        let mut input = Vec::new();
+        for n in 0..=256 {
+            let value = "a".repeat(n);
+            for row in [
+                format!("{value},x,\"é\","),
+                format!("a,\"{value}\",c,\r"),
+                format!("a,{value}\",c,d"),
+                format!("a,\"{value}\"\",c,d"),
+                format!("{value},wrong,count"),
+                format!("{value},1,2,3,4"),
+                format!("a,{value},c,\0"),
+            ] {
+                input.extend_from_slice(row.as_bytes());
+                input.push(b'\n');
+            }
+        }
+        input.pop();
+        for start in 0..64 {
+            let bytes = &input[start..];
+            let expected: Vec<_> = lines(bytes).filter_map(fields_generic::<4>).collect();
+            let mut actual = Vec::new();
+            visit_rows(bytes, |row| actual.push(row));
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn calendar_tables_match_all_dates_in_a_gregorian_cycle() {
+        use chrono::NaiveDate;
+        for year in (1600..=2000).chain([1, 9999]) {
+            for month in 0..=13 {
+                for day in 0..=32 {
+                    let expected = NaiveDate::from_ymd_opt(year as i32, month, day).map(|date| {
+                        date.and_hms_opt(0, 0, 0)
+                            .unwrap()
+                            .and_utc()
+                            .timestamp_millis()
+                    });
+                    assert_eq!(super::utc_midnight(year, month, day), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_dates_validate_the_full_date_and_time_zone() {
+        let mut ts = Timestamps::default();
+        for (s, expected) in [
+            ("1970-01-01T00:00:00Z", Some(0)),
+            ("1970-01-01T00:00:00+00:01", Some(-60_000)),
+            ("1970-01-01T00:00:00-00:01", Some(60_000)),
+            ("1969-12-31T23:59:59Z", Some(-1000)),
+            ("2000-02-29T00:00:00Z", Some(951782400000)),
+            ("1900-02-29T00:00:00Z", None),
+            ("2000-02-29T00:00:00+24:00", None),
+            ("2000-02-29T23:59:60Z", None),
+            ("2000-02-29T23:59:59+00:60", None),
+            ("0000-01-01T00:00:00Z", None),
+            ("2000/02-29T00:00:00Z", None),
+            ("2000-02-29T00:00:0/Z", None),
+            ("00000000000000000000000042", Some(42)),
+        ] {
+            assert_eq!(ts.parse(s.as_bytes()), expected, "{s}");
         }
     }
 }

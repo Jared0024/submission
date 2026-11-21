@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+bytes = "1"
 hashbrown = { version = "0.16", default-features = false }
 memchr = "2"
 memmap2 = "0.9"
@@ -14,3 +14,10 @@ parquet = { version = "=57.3.0", default-features = false, features = ["snap"] }
 rayon = "1.10"
 rustc-hash = "2"
 serde_json = "1"
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

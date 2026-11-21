@@ -1,4 +1,5 @@
 mod input;
+mod names;
 mod output;
 mod partition;
 mod report;
@@ -24,7 +25,14 @@ fn main() -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .build()?;
-    let input = Input::open(&data)?;
+    // At most a quarter of the advertised memory for shared read-only event maps.
+    // Without a memory hint, parse and release one range at a time.
+    let mapping_budget = env::var("MEM_GB")
+        .ok()
+        .and_then(|gb| gb.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1 << 28);
+    let input = Input::open(&data, mapping_budget)?;
     let dimensions = input.dimensions();
     let base = input.start.saturating_sub(WEEK_MS);
     pool.install(|| {
