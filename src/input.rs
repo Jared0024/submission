@@ -295,14 +295,77 @@ fn fields_masked<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn decode_fields<const N: usize>(line: &[u8], commas: u128, quotes: u32) -> Option<[&[u8]; N]> {
-    if commas.count_ones() as usize + 1 != N {
+    let low = commas as u64;
+    let high = (commas >> 64) as u64;
+    let lower_fields = low.count_ones();
+    if (lower_fields + high.count_ones()) as usize + 1 != N {
         return None;
+    }
+    // The common seven-column shapes cross byte 64 after delimiter 3, 4 or 5.
+    // Work on native words so a low-word borrow never crosses the boundary.
+    if N == 7 && (3..=5).contains(&lower_fields) {
+        let ends = match lower_fields {
+            3 => word_ends::<N, 3>(low, high, line.len()),
+            4 => word_ends::<N, 4>(low, high, line.len()),
+            _ => word_ends::<N, 5>(low, high, line.len()),
+        };
+        return if quotes == 0 {
+            split_at_ends::<N, false>(line, ends, quotes)
+        } else {
+            split_at_ends::<N, true>(line, ends, quotes)
+        };
     }
     if quotes == 0 {
         split_fields::<N, false>(line, commas, quotes)
     } else {
         split_fields::<N, true>(line, commas, quotes)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn word_ends<const N: usize, const LOW: usize>(
+    mut low: u64,
+    mut high: u64,
+    len: usize,
+) -> [usize; N] {
+    let mut ends = [len; N];
+    for end in &mut ends[..LOW] {
+        *end = low.trailing_zeros() as usize;
+        low &= low.wrapping_sub(1);
+    }
+    for end in &mut ends[LOW..N - 1] {
+        *end = 64 + high.trailing_zeros() as usize;
+        high &= high.wrapping_sub(1);
+    }
+    ends
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn field_value<'a, const QUOTED: bool>(raw: &'a [u8], paired: &mut u32) -> Option<&'a [u8]> {
+    if QUOTED && raw.first() == Some(&b'"') {
+        *paired += 2;
+        return raw[1..].strip_suffix(b"\"");
+    }
+    Some(raw)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn split_at_ends<const N: usize, const QUOTED: bool>(
+    line: &[u8],
+    ends: [usize; N],
+    quotes: u32,
+) -> Option<[&[u8]; N]> {
+    let mut values: [&[u8]; N] = [&[]; N];
+    let mut start = 0;
+    let mut paired = 0;
+    for (value, end) in values.iter_mut().zip(ends) {
+        *value = field_value::<QUOTED>(&line[start..end], &mut paired)?;
+        start = end + 1;
+    }
+    (paired == quotes).then_some(values)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -323,13 +386,7 @@ fn split_fields<const N: usize, const QUOTED: bool>(
             commas &= commas.wrapping_sub(1);
             end
         };
-        let raw = &line[start..end];
-        if QUOTED && raw.first() == Some(&b'"') {
-            *value = raw[1..].strip_suffix(b"\"")?;
-            paired += 2;
-        } else {
-            *value = raw;
-        }
+        *value = field_value::<QUOTED>(&line[start..end], &mut paired)?;
         start = end + 1;
     }
     (paired == quotes).then_some(values)
@@ -677,6 +734,49 @@ fn linked_people(files: &[Mmap]) -> LinkedPeople<'_> {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn word_split_matches_scalar_at_byte_64() {
+        for pivot in 0..7 {
+            for length in 35..71 {
+                for mask in [0_u8, 1, 7, 21, 63, 127] {
+                    let mut row = Vec::new();
+                    for field in 0..7 {
+                        if field != 0 {
+                            row.push(b',');
+                        }
+                        let quoted = (mask >> field) & 1 != 0;
+                        if quoted {
+                            row.push(b'"');
+                        }
+                        row.extend(std::iter::repeat_n(
+                            b'a',
+                            if field == pivot { length } else { 4 },
+                        ));
+                        if quoted {
+                            row.push(b'"');
+                        }
+                    }
+                    assert_eq!(
+                        super::fields_masked::<7>(&row),
+                        super::fields_generic::<7>(&row)
+                    );
+                    for at in [62, 63, 64, 65] {
+                        if at < row.len() {
+                            let old = row[at];
+                            row[at] = b'"';
+                            assert_eq!(
+                                super::fields_masked::<7>(&row),
+                                super::fields_generic::<7>(&row)
+                            );
+                            row[at] = old;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use super::{fields, fields_generic};
 
     #[test]
