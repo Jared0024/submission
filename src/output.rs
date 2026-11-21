@@ -56,7 +56,7 @@ const ROW_GROUP: usize = 65_536;
 
 pub fn write_all(
     output: &Path,
-    users: Vec<Vec<UserDay<'_>>>,
+    mut users: Vec<Vec<UserDay<'_>>>,
     campaigns: CampaignDays,
     people: &[Cow<'_, [u8]>],
     names: &[(Id<'_>, Id<'_>)],
@@ -64,18 +64,21 @@ pub fn write_all(
     let (user_result, campaign_result) = rayon::join(
         || {
             write_table(output, "user_daily", USER, |writer| {
-                let batches: Vec<_> = users
-                    .iter()
-                    .flat_map(|rows| rows.chunks(ROW_GROUP))
+                let mut batches: Vec<_> = users
+                    .iter_mut()
+                    .flat_map(|rows| rows.chunks_mut(ROW_GROUP))
                     .collect();
                 // Limit buffered groups to one per worker. Append in order to keep a
                 // single output file and preserve atomic replacement on a rerun.
-                for wave in batches.chunks(rayon::current_num_threads()) {
+                for wave in batches.chunks_mut(rayon::current_num_threads()) {
                     let schema = writer.schema_descr();
                     let props = writer.properties();
                     let groups: Vec<_> = wave
-                        .par_iter()
-                        .map(|rows| encode_users(rows, people, schema, props))
+                        .par_iter_mut()
+                        .map(|rows| {
+                            group_unpurchased(rows);
+                            encode_users(rows, people, schema, props)
+                        })
                         .collect::<Result<_>>()?;
                     for columns in groups {
                         let mut group = writer.next_row_group()?;
@@ -147,6 +150,25 @@ pub fn write_all(
     user_result?;
     campaign_result?;
     Ok(())
+}
+
+// Keep zero-revenue rows with a null category together so that both
+// Parquet columns can encode long runs. Output keys do not depend on order.
+fn group_unpurchased(rows: &mut [UserDay<'_>]) {
+    let is_unpurchased = |row: &UserDay<'_>| row.revenue == 0 && row.top_category.is_none();
+    let mut right = rows.len();
+    let mut left = 0;
+    while left < right {
+        if is_unpurchased(&rows[left]) {
+            left += 1;
+        } else {
+            right -= 1;
+            if is_unpurchased(&rows[right]) {
+                rows.swap(left, right);
+                left += 1;
+            }
+        }
+    }
 }
 
 type EncodedColumn = (Bytes, ColumnCloseResult);
