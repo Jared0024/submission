@@ -18,11 +18,18 @@ impl InlineId {
             if (x | zeros) & HIGH != 0 || !(1..128).contains(last) {
                 return None;
             }
-            // Remove the empty high bit from adjacent pairs, then from
-            // each pair of pairs. The low 56 bits now hold all eight bytes.
-            let pairs = (x & 0x007f_007f_007f_007f) | ((x & 0x7f00_7f00_7f00_7f00) >> 1);
-            let quads = (pairs & 0x0000_3fff_0000_3fff) | ((pairs & 0x3fff_0000_3fff_0000) >> 2);
-            let eight = (quads & 0x0fff_ffff) | ((quads >> 32) << 28);
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            // This binary only runs on BMI2-capable CPUs. Extract the seven low bits of each byte.
+            let eight = unsafe { std::arch::x86_64::_pext_u64(x, !HIGH) };
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            let eight = {
+                // Remove the empty high bit from adjacent pairs, then from
+                // each pair of pairs. The low 56 bits now hold all eight bytes.
+                let pairs = (x & 0x007f_007f_007f_007f) | ((x & 0x7f00_7f00_7f00_7f00) >> 1);
+                let quads =
+                    (pairs & 0x0000_3fff_0000_3fff) | ((pairs & 0x3fff_0000_3fff_0000) >> 2);
+                (quads & 0x0fff_ffff) | ((quads >> 32) << 28)
+            };
             return Some(Self((eight << 7) | u64::from(*last)));
         }
         if bytes.len() > 8 {
