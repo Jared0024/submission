@@ -16,6 +16,67 @@ pub const WEEK_MS: i64 = 7 * DAY_MS;
 pub const GAP_MS: i64 = 30 * 60 * 1000;
 pub type Id<'a> = &'a [u8];
 
+// Catalogs containing one prefix and a compact range of canonical decimal
+// suffixes can use direct addressing. Keep arbitrary byte identifiers exact.
+pub enum DimensionIndex<'a, V> {
+    Dense {
+        prefix: Id<'a>,
+        values: Vec<Option<V>>,
+    },
+    General(FxHashMap<Id<'a>, V>),
+}
+
+impl<'a, V: Copy> DimensionIndex<'a, V> {
+    fn from_map(map: FxHashMap<Id<'a>, V>) -> Self {
+        if let Some(dense) = Self::dense(&map) {
+            return dense;
+        }
+        Self::General(map)
+    }
+
+    fn dense(map: &FxHashMap<Id<'a>, V>) -> Option<Self> {
+        let &sample = map.keys().next()?;
+        let split = sample
+            .iter()
+            .rposition(|b| !b.is_ascii_digit())
+            .map_or(0, |i| i + 1);
+        let prefix = &sample[..split];
+        let limit = map.len().checked_mul(2)?;
+        let mut values = Vec::new();
+        for (&id, &value) in map {
+            let i = Self::suffix(id, prefix)?;
+            if i >= limit {
+                return None;
+            }
+            if values.len() <= i {
+                values.resize(i + 1, None);
+            }
+            values[i] = Some(value);
+        }
+        Some(Self::Dense { prefix, values })
+    }
+
+    #[inline]
+    fn suffix(key: &[u8], prefix: &[u8]) -> Option<usize> {
+        let digits = key.strip_prefix(prefix)?;
+        if digits.is_empty() || digits.len() > 6 || (digits[0] == b'0' && digits.len() > 1) {
+            return None;
+        }
+        digits.iter().try_fold(0usize, |n, &digit| {
+            let d = digit.wrapping_sub(b'0');
+            (d < 10).then_some(n * 10 + usize::from(d))
+        })
+    }
+
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
+        match self {
+            Self::Dense { prefix, values } => values.get(Self::suffix(key, prefix)?)?.as_ref(),
+            Self::General(map) => map.get(key),
+        }
+    }
+}
+
 pub struct Input {
     events: Vec<PathBuf>,
     mapping_budget: u64,
@@ -29,9 +90,9 @@ pub struct Input {
 
 pub struct Dimensions<'a> {
     pub people: LinkedPeople<'a>,
-    pub products: FxHashMap<Id<'a>, u32>,
+    pub products: DimensionIndex<'a, u32>,
     pub categories: Vec<Id<'a>>,
-    pub campaigns: FxHashMap<Id<'a>, usize>,
+    pub campaigns: DimensionIndex<'a, usize>,
     pub campaign_names: Vec<(Id<'a>, Id<'a>)>,
 }
 
@@ -117,9 +178,9 @@ impl Input {
         campaign_names.push((b"organic", b"organic"));
         Dimensions {
             people,
-            products,
+            products: DimensionIndex::from_map(products),
             categories,
-            campaigns,
+            campaigns: DimensionIndex::from_map(campaigns),
             campaign_names,
         }
     }
@@ -678,6 +739,32 @@ fn linked_people(files: &[Mmap]) -> LinkedPeople<'_> {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::{fields, fields_generic};
+
+    #[test]
+    fn catalog_indexes_preserve_byte_keys_and_absent_values() {
+        use super::{DimensionIndex, FxHashMap};
+        for (keys, dense) in [
+            (vec![b"c_1".as_slice(), b"c_3", b"c_0"], true),
+            (vec![b"p1".as_slice(), b"p01"], false),
+            (vec![b"p1".as_slice(), b"q2", b"p2"], false),
+            (vec![b"p1".as_slice(), b"p999999"], false),
+            (vec![b"".as_slice(), b"x\x00"], false),
+        ] {
+            let map: FxHashMap<_, _> = keys.iter().copied().zip(0..).collect();
+            let index = DimensionIndex::from_map(map.clone());
+            assert_eq!(matches!(index, DimensionIndex::Dense { .. }), dense);
+            for key in keys.into_iter().chain([
+                b"c_01".as_slice(),
+                b"c_2",
+                b"c_x",
+                b"p",
+                b"c_0000001",
+                b"c_1\x00",
+            ]) {
+                assert_eq!(index.get(key), map.get(key));
+            }
+        }
+    }
 
     #[test]
     fn delimiter_masks_match_the_scalar_parser_at_every_vector_boundary() {
