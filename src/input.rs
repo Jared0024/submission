@@ -394,10 +394,73 @@ fn split_fields<const N: usize, const QUOTED: bool>(
 
 pub fn visit_rows<'a, const N: usize>(bytes: &'a [u8], mut visit: impl FnMut([&'a [u8]; N])) {
     #[cfg(target_arch = "x86_64")]
+    if N == 7
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("popcnt")
+    {
+        // SAFETY: detection includes OS support for the vector register state.
+        unsafe { visit_event_rows_wide(bytes, visit) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("popcnt") {
         // SAFETY: both features were detected before entering the specialized loop.
         unsafe { visit_rows_avx2(bytes, visit) };
         return;
+    }
+    for row in lines(bytes).filter_map(fields::<N>) {
+        visit(row);
+    }
+}
+
+// Keep delimiter masks in native 64-bit words. The first block usually has
+// no newline, so it contributes all its commas and quotes unchanged.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,popcnt")]
+unsafe fn visit_event_rows_wide<'a, const N: usize>(
+    mut bytes: &'a [u8],
+    mut visit: impl FnMut([&'a [u8]; N]),
+) {
+    use std::arch::x86_64::*;
+    while bytes.len() >= 128 {
+        // SAFETY: both unaligned 64-byte loads fit in the checked slice.
+        let first = unsafe { _mm512_loadu_si512(bytes.as_ptr().cast()) };
+        let mask = |v, c| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(c));
+        let low_comma = mask(first, b',' as i8);
+        let low_quote = mask(first, b'"' as i8);
+        let low_end = mask(first, b'\n' as i8);
+        let (end, commas, quotes) = if low_end != 0 {
+            let before = low_end.wrapping_sub(1) & !low_end;
+            (
+                low_end.trailing_zeros() as usize,
+                u128::from(low_comma & before),
+                (low_quote & before).count_ones(),
+            )
+        } else {
+            let second = unsafe { _mm512_loadu_si512(bytes.as_ptr().add(64).cast()) };
+            let high_end = mask(second, b'\n' as i8);
+            if high_end == 0 {
+                let end = memchr(b'\n', &bytes[128..]).map_or(bytes.len(), |pos| 128 + pos);
+                if let Some(row) = fields_generic(&bytes[..end]) {
+                    visit(row);
+                }
+                bytes = bytes.get(end + 1..).unwrap_or_default();
+                continue;
+            }
+            let before = high_end.wrapping_sub(1) & !high_end;
+            let high_comma = mask(second, b',' as i8) & before;
+            let high_quote = mask(second, b'"' as i8) & before;
+            (
+                64 + high_end.trailing_zeros() as usize,
+                u128::from(low_comma) | (u128::from(high_comma) << 64),
+                low_quote.count_ones() + high_quote.count_ones(),
+            )
+        };
+        if let Some(row) = decode_fields(&bytes[..end], commas, quotes) {
+            visit(row);
+        }
+        bytes = &bytes[end + 1..];
     }
     for row in lines(bytes).filter_map(fields::<N>) {
         visit(row);
@@ -734,6 +797,43 @@ fn linked_people(files: &[Mmap]) -> LinkedPeople<'_> {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
+    #[test]
+    fn wide_visitor_matches_scalar_on_row_and_load_boundaries() {
+        if !(is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("popcnt"))
+        {
+            return;
+        }
+        let mut input = Vec::new();
+        for length in [
+            7_usize, 31, 32, 62, 63, 64, 65, 94, 95, 96, 126, 127, 128, 129, 257,
+        ] {
+            for suffix in [
+                b",a,b,c,d,e,f".as_slice(),
+                b",a,b,c,d,e,\"\"",
+                b",a,b,c,d,\"e,f",
+                b",a,b,c,d,e,\"]",
+                b",a,b,c,d,e,",
+            ] {
+                let start = input.len();
+                input.resize(start + length.saturating_sub(suffix.len()), b'x');
+                input.extend_from_slice(suffix);
+                input.push(b'\n');
+            }
+        }
+        let repeated = input.clone();
+        input.extend(repeated);
+        input.pop();
+        let expected: Vec<_> = super::lines(&input)
+            .filter_map(super::fields_generic::<7>)
+            .collect();
+        let mut actual = Vec::new();
+        // SAFETY: runtime detection above guards the target features.
+        unsafe { super::visit_event_rows_wide::<7>(&input, |row| actual.push(row)) };
+        assert_eq!(actual, expected);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn word_split_matches_scalar_at_byte_64() {
