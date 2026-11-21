@@ -27,31 +27,184 @@ pub struct CampaignTotals {
 
 pub type CampaignDays = FxHashMap<(usize, i32), CampaignTotals>;
 
+#[derive(Clone, Copy)]
+struct Grid {
+    first_day: i32,
+    campaigns: usize,
+    cells: usize,
+}
+
+impl Grid {
+    fn new(window: std::ops::Range<i64>, campaigns: usize, shards: usize) -> Option<Self> {
+        if window.is_empty() {
+            return None;
+        }
+        let first_day = i32::try_from(window.start.div_euclid(DAY_MS)).ok()?;
+        let last_day = i32::try_from((window.end - 1).div_euclid(DAY_MS)).ok()?;
+        let days = usize::try_from(i64::from(last_day) - i64::from(first_day) + 1).ok()?;
+        let cells = days.checked_mul(campaigns)?;
+        // All shards can finish before the final merge. Bound their combined
+        // dense storage, including the separate eight-byte assist counters.
+        let budget = (32 << 20) / size_of::<CampaignTotals>() / shards;
+        (cells <= budget).then_some(Self {
+            first_day,
+            campaigns,
+            cells,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Credit {
+    sessions: i64,
+    purchases: i64,
+    revenue: i64,
+}
+
+enum CampaignPart {
+    Dense {
+        grid: Grid,
+        credit: Vec<Credit>,
+        assists: Vec<i64>,
+    },
+    Sparse(CampaignDays),
+}
+
+impl CampaignPart {
+    fn new(grid: Option<Grid>) -> Self {
+        match grid {
+            Some(grid) => Self::Dense {
+                grid,
+                credit: vec![Credit::default(); grid.cells],
+                assists: vec![0; grid.cells],
+            },
+            None => Self::Sparse(CampaignDays::default()),
+        }
+    }
+
+    fn record(&mut self, campaign: usize, day: i32, revenue: i64, active: &[usize]) {
+        match self {
+            Self::Dense {
+                grid,
+                credit,
+                assists,
+            } => {
+                let start = (i64::from(day) - i64::from(grid.first_day)) as usize * grid.campaigns;
+                let row = &mut credit[start + campaign];
+                row.sessions += 1;
+                row.purchases += i64::from(revenue > 0);
+                row.revenue += revenue;
+                let day_assists = &mut assists[start..start + grid.campaigns];
+                for &id in active {
+                    day_assists[id] += 1;
+                }
+            }
+            Self::Sparse(rows) => {
+                let row = rows.entry((campaign, day)).or_default();
+                row.sessions += 1;
+                row.purchasing_sessions += i64::from(revenue > 0);
+                row.revenue += revenue;
+                for &id in active {
+                    rows.entry((id, day)).or_default().assists += 1;
+                }
+            }
+        }
+    }
+
+    fn combine(parts: Vec<Self>) -> CampaignDays {
+        let mut parts = parts.into_iter();
+        let Some(mut total) = parts.next() else {
+            return CampaignDays::default();
+        };
+        // Every shopper shard shares the reporting window and catalog.
+        for part in parts {
+            match (&mut total, part) {
+                (
+                    Self::Dense {
+                        credit, assists, ..
+                    },
+                    Self::Dense {
+                        credit: other,
+                        assists: counts,
+                        ..
+                    },
+                ) => {
+                    for (row, add) in credit.iter_mut().zip(other) {
+                        row.sessions += add.sessions;
+                        row.purchases += add.purchases;
+                        row.revenue += add.revenue;
+                    }
+                    for (row, add) in assists.iter_mut().zip(counts) {
+                        *row += add;
+                    }
+                }
+                (Self::Sparse(rows), Self::Sparse(other)) => {
+                    for (key, add) in other {
+                        let row = rows.entry(key).or_default();
+                        row.sessions += add.sessions;
+                        row.purchasing_sessions += add.purchasing_sessions;
+                        row.revenue += add.revenue;
+                        row.assists += add.assists;
+                    }
+                }
+                _ => unreachable!("shards share a single campaign grid"),
+            }
+        }
+        match total {
+            Self::Sparse(rows) => rows,
+            Self::Dense {
+                grid,
+                credit,
+                assists,
+            } => credit
+                .into_iter()
+                .zip(assists)
+                .enumerate()
+                .filter(|(_, (row, assists))| row.sessions != 0 || *assists != 0)
+                .map(|(cell, (row, assists))| {
+                    let day = i64::from(grid.first_day) + (cell / grid.campaigns) as i64;
+                    (
+                        (cell % grid.campaigns, day as i32),
+                        CampaignTotals {
+                            sessions: row.sessions,
+                            purchasing_sessions: row.purchases,
+                            revenue: row.revenue,
+                            assists,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
 pub fn build<'a, T: Stamp, S: Sale>(
     partitions: Vec<ShopperPartition<'a, T, S>>,
     dimensions: &Dimensions<'a>,
     people: usize,
     base: i64,
+    window: std::ops::Range<i64>,
 ) -> (Vec<Vec<UserDay<'a>>>, CampaignDays) {
     let shards = partitions.len();
+    let grid = Grid::new(window, dimensions.campaign_names.len(), shards).filter(|grid| {
+        // Each shard clears and later merges a full grid. On sparse inputs a
+        // map costs less than visiting more grid cells than surviving events.
+        let events: usize = partitions
+            .iter()
+            .flat_map(|p| &p.events)
+            .map(Vec::len)
+            .sum();
+        grid.cells <= events / shards
+    });
     let results: Vec<_> = partitions
         .into_par_iter()
         .enumerate()
-        .map(|(shard, partition)| summarize(partition, dimensions, people, shard, shards, base))
+        .map(|(shard, partition)| {
+            summarize(partition, dimensions, people, shard, shards, base, grid)
+        })
         .collect();
-    let mut users = Vec::new();
-    let mut campaigns = CampaignDays::default();
-    for (user_rows, campaign_rows) in results {
-        users.push(user_rows);
-        for (key, partial) in campaign_rows {
-            let total = campaigns.entry(key).or_default();
-            total.sessions += partial.sessions;
-            total.purchasing_sessions += partial.purchasing_sessions;
-            total.revenue += partial.revenue;
-            total.assists += partial.assists;
-        }
-    }
-    (users, campaigns)
+    let (users, partials): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    (users, CampaignPart::combine(partials))
 }
 
 fn summarize<'a, T: Stamp, S: Sale>(
@@ -61,7 +214,8 @@ fn summarize<'a, T: Stamp, S: Sale>(
     shard: usize,
     shards: usize,
     base: i64,
-) -> (Vec<UserDay<'a>>, CampaignDays) {
+    grid: Option<Grid>,
+) -> (Vec<UserDay<'a>>, CampaignPart) {
     debug_assert!(shards.is_power_of_two());
     let shard_bits = shards.trailing_zeros();
     let groups = people.div_ceil(shards);
@@ -79,7 +233,7 @@ fn summarize<'a, T: Stamp, S: Sale>(
     );
 
     let mut users = Vec::new();
-    let mut campaigns = CampaignDays::default();
+    let mut campaigns = CampaignPart::new(grid);
     let mut categories = CategoryTotals::new(dimensions.categories.len());
     let organic = dimensions.campaign_names.len() - 1;
     let mut window = ClickWindow::new(dimensions.campaign_names.len());
@@ -124,13 +278,7 @@ fn summarize<'a, T: Stamp, S: Sale>(
             current.revenue += revenue;
 
             let credited = window.advance(clicks, start, base).unwrap_or(organic);
-            let summary = campaigns.entry((credited, day)).or_default();
-            summary.sessions += 1;
-            summary.purchasing_sessions += i64::from(revenue > 0);
-            summary.revenue += revenue;
-            for &campaign in &window.active {
-                campaigns.entry((campaign, day)).or_default().assists += 1;
-            }
+            campaigns.record(credited, day, revenue, &window.active);
         }
         if let Some(mut last) = current_day {
             last.top_category = categories.finish_day(&dimensions.categories);
@@ -307,6 +455,42 @@ impl ClickWindow {
 #[cfg(test)]
 mod tests {
     use super::group;
+
+    #[test]
+    fn campaign_grid_and_sparse_merge_agree_across_midnight_and_assists() {
+        use super::{CampaignPart, DAY_MS, Grid};
+
+        let grid = Grid::new(-1..DAY_MS, 3, 8).unwrap();
+        assert_eq!(grid.first_day, -1);
+        assert_eq!(grid.cells, 6);
+        assert!(Grid::new(0..0, 3, 8).is_none());
+        assert!(Grid::new(0..365 * DAY_MS, 100_000, 8).is_none());
+
+        for layout in [Some(grid), None] {
+            let mut a = CampaignPart::new(layout);
+            let mut b = CampaignPart::new(layout);
+            a.record(2, -1, 0, &[]);
+            a.record(1, 0, 12, &[0, 1]);
+            b.record(1, 0, 0, &[0]);
+            let combined = CampaignPart::combine(vec![a, b]);
+            let row = &combined[&(1, 0)];
+            assert_eq!(
+                (
+                    row.sessions,
+                    row.purchasing_sessions,
+                    row.revenue,
+                    row.assists
+                ),
+                (2, 1, 12, 1)
+            );
+            assert_eq!(
+                (combined[&(0, 0)].sessions, combined[&(0, 0)].assists),
+                (0, 2)
+            );
+            assert_eq!(combined[&(2, -1)].sessions, 1);
+            assert_eq!(combined.len(), 3);
+        }
+    }
 
     #[test]
     fn scatter_initializes_disjoint_ranges_including_empty_shoppers() {

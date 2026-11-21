@@ -66,7 +66,13 @@ fn run<T: Stamp, S: Sale>(
     output: &Path,
 ) -> Result<()> {
     let (partitions, people) = partition::partition::<T, S>(input, dimensions, workers, base)?;
-    let (users, campaigns) = report::build(partitions, dimensions, people.len(), base);
+    let (users, campaigns) = report::build(
+        partitions,
+        dimensions,
+        people.len(),
+        base,
+        input.start..input.end,
+    );
     output::write_all(
         output,
         users,
