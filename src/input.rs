@@ -134,7 +134,7 @@ fn map_open(file: &File) -> Result<Option<Mmap>> {
     if file.metadata()?.len() == 0 {
         return Ok(None);
     }
-    // Inputs are mounted read-only for the entire run.
+    // Challenge inputs are mounted read-only for the entire run.
     Ok(Some(unsafe { Mmap::map(file) }?))
 }
 
@@ -147,8 +147,9 @@ pub struct EventChunk<'a> {
 }
 
 impl EventChunk<'_> {
-    pub fn visit<const N: usize>(&self, visit: impl FnMut([&[u8]; N])) -> Result<()> {
-        if let Some(mapping) = &self.shared {
+    pub fn visit<const N: usize>(self, visit: impl FnMut([&[u8]; N])) -> Result<()> {
+        // The last reader releases this file mapping when the visitor returns.
+        if let Some(mapping) = self.shared {
             visit_rows(&mapping[self.range.clone()], visit);
             return Ok(());
         }
@@ -465,16 +466,27 @@ fn utc_midnight(year: u32, month: u32, day: u32) -> Option<i64> {
     Some(i64::from(days) * DAY_MS)
 }
 
-// Each parse batch caches validated UTC midnights. A full YYYYMMDD key
-// distinguishes months, years and invalid input even when the slot collides.
+// Each batch caches validated UTC midnights. Keeping both hyphens in the
+// cached prefix lets a hit skip checking them and assembling a digit-only key.
+#[derive(Clone, Copy)]
+struct CachedDate {
+    year_month: u64,
+    day: [u8; 2],
+    midnight: i64,
+}
+
 pub struct Timestamps {
-    days: [(u64, i64); 32],
+    days: [CachedDate; 32],
 }
 
 impl Default for Timestamps {
     fn default() -> Self {
         Self {
-            days: [(u64::from_le_bytes(*b"19700101"), 0); 32],
+            days: [CachedDate {
+                year_month: u64::from_le_bytes(*b"1970-01-"),
+                day: *b"01",
+                midnight: 0,
+            }; 32],
         }
     }
 }
@@ -488,12 +500,54 @@ fn pair(a: u8, b: u8) -> Option<u32> {
     Some(u32::from(tens) * 10 + u32::from(ones))
 }
 
+// Decode HH:MM:SS from a validated date-cache hit. XOR with ASCII zero
+// gives each digit its numerical value. Adding 0x7f minus each lane's
+// maximum sets its high bit on overflow. Checking original high bits also
+// rejects non-ASCII bytes. Separator lanes still need an exact comparison.
+#[inline]
+fn utc_clock_seconds(raw: [u8; 8]) -> Option<u32> {
+    const MAX: u64 = u64::from_le_bytes([2, 9, 10, 5, 9, 10, 5, 9]);
+    const SEPARATORS: u64 = u64::from_le_bytes([0, 0, 255, 0, 0, 255, 0, 0]);
+    let word = u64::from_le_bytes(raw);
+    let digits = word ^ u64::from_le_bytes(*b"00000000");
+    let too_large = digits.wrapping_add(0x7f7f_7f7f_7f7f_7f7f - MAX);
+    if (word ^ u64::from_le_bytes(*b"00:00:00")) & SEPARATORS != 0
+        || (digits | too_large) & 0x8080_8080_8080_8080 != 0
+    {
+        return None;
+    }
+    const TENS: u64 = u64::from_le_bytes([255, 0, 0, 255, 0, 0, 255, 0]);
+    let pairs = (digits & TENS) * 10 + ((digits >> 8) & TENS);
+    let hour = (pairs & 255) as u32;
+    let minute = ((pairs >> 24) & 255) as u32;
+    let second = (pairs >> 48) as u32;
+    (hour < 24).then_some(hour * 3600 + minute * 60 + second)
+}
+
 impl Timestamps {
+    #[inline]
     pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        if let Ok(raw) = <&[u8; 20]>::try_from(s)
+            && raw[10] == b'T'
+            && raw[19] == b'Z'
+        {
+            let day = [raw[8], raw[9]];
+            let cached = &self.days[(usize::from(day[0]) * 10 + usize::from(day[1])) & 31];
+            if cached.year_month == u64::from_le_bytes(raw[..8].try_into().unwrap())
+                && cached.day == day
+            {
+                let clock = raw[11..19].try_into().unwrap();
+                return Some(cached.midnight + i64::from(utc_clock_seconds(clock)?) * 1000);
+            }
+        }
+        self.parse_general(s)
+    }
+
+    fn parse_general(&mut self, s: &[u8]) -> Option<i64> {
         if !matches!(s.len(), 20 | 25) || s[10] != b'T' {
             return digits(s);
         }
-        if s[4] != b'-' || s[7] != b'-' || s[13] != b':' || s[16] != b':' {
+        if s[13] != b':' || s[16] != b':' {
             return None;
         }
 
@@ -516,17 +570,22 @@ impl Timestamps {
             }
             _ => return None,
         };
-        let key = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[5], s[6], s[8], s[9]]);
-        let slot = &mut self.days[(usize::from(s[8]) * 10 + usize::from(s[9])) & 31];
-        if slot.0 != key {
+        let prefix = u64::from_le_bytes(s[..8].try_into().unwrap());
+        let day = [s[8], s[9]];
+        let cached = &mut self.days[(usize::from(day[0]) * 10 + usize::from(day[1])) & 31];
+        if cached.year_month != prefix || cached.day != day {
+            if s[4] != b'-' || s[7] != b'-' {
+                return None;
+            }
             let year = pair(s[0], s[1])? * 100 + pair(s[2], s[3])?;
-            *slot = (
-                key,
-                utc_midnight(year, pair(s[5], s[6])?, pair(s[8], s[9])?)?,
-            );
+            *cached = CachedDate {
+                year_month: prefix,
+                day,
+                midnight: utc_midnight(year, pair(s[5], s[6])?, pair(day[0], day[1])?)?,
+            };
         }
         let seconds = i64::from(hour * 3600 + minute * 60 + second) - offset_minutes * 60;
-        Some(slot.1 + seconds * 1000)
+        Some(cached.midnight + seconds * 1000)
     }
 }
 
@@ -711,10 +770,27 @@ mod ingestion_tests {
     }
 
     #[test]
+    fn cached_utc_clock_matches_checked_parser_for_every_byte() {
+        let mut dates = Timestamps::default();
+        let seed = *b"2028-02-29T23:59:58Z";
+        assert!(dates.parse(&seed).is_some());
+        for position in 0..seed.len() {
+            for byte in 0..=255 {
+                let mut raw = seed;
+                raw[position] = byte;
+                assert_eq!(dates.parse(&raw), Timestamps::default().parse_general(&raw));
+            }
+        }
+    }
+
+    #[test]
     fn cached_dates_validate_the_full_date_and_time_zone() {
         let mut ts = Timestamps::default();
         for (s, expected) in [
             ("1970-01-01T00:00:00Z", Some(0)),
+            ("1970/01-01T00:00:00Z", None),
+            ("1970-01/01T00:00:00Z", None),
+            ("1970-01-0QT00:00:00Z", None), // Same cache index as 01.
             ("1970-01-01T00:00:00+00:01", Some(-60_000)),
             ("1970-01-01T00:00:00-00:01", Some(60_000)),
             ("1969-12-31T23:59:59Z", Some(-1000)),

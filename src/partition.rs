@@ -58,8 +58,8 @@ impl Sale for u64 {
 const INVALID: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Default)]
-pub struct Event<T, S> {
-    pub person: u32,
+pub struct Event<T, S, P = u32> {
+    pub person: P,
     pub activity: Activity<T, S>,
 }
 
@@ -69,10 +69,63 @@ pub struct Activity<T, S> {
     pub sale: S,
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct ShopperKey(u64);
+
+impl ShopperKey {
+    const INVALID: Self = Self(u64::MAX);
+
+    #[inline]
+    fn new(raw: &[u8], spill: &mut Spill, long_shoppers: &mut HashTable<EventId>) -> Self {
+        if let Some(key) = InlineId::new(raw) {
+            return Self(key.0);
+        }
+        // Repeated long aliases share one owned copy until the batch's claims
+        // finish deduplication. The table never borrows from a growing buffer.
+        let hash = FxBuildHasher.hash_one(raw);
+        let id = match long_shoppers.entry(
+            hash,
+            |id| spill.get(*id) == raw,
+            |id| FxBuildHasher.hash_one(spill.get(*id)),
+        ) {
+            Entry::Occupied(slot) => *slot.get(),
+            Entry::Vacant(slot) => {
+                let id = spill.push(raw);
+                slot.insert(id);
+                id
+            }
+        };
+        Self(id.0)
+    }
+
+    fn resolve(self, spill: &Spill, dimensions: &Dimensions<'_>, names: &mut Names) -> Option<u32> {
+        if self == Self::INVALID {
+            return None;
+        }
+        let (short, raw) = if self.0 < EventId::SPILL {
+            (Some(InlineId(self.0)), &[][..])
+        } else {
+            (None, spill.get(EventId(self.0)))
+        };
+        Some(
+            dimensions
+                .people
+                .aliases
+                .get(raw, short)
+                .unwrap_or_else(|| {
+                    unlinked_index(
+                        dimensions.people.names.len() as u32,
+                        names.intern(raw, short),
+                    )
+                }),
+        )
+    }
+}
+
 struct Claim<T, S> {
     id: EventId,
     ingested: Ingest,
-    event: Event<T, S>,
+    event: Event<T, S, ShopperKey>,
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +146,45 @@ struct EventId(u64);
 
 impl EventId {
     const SPILL: u64 = 1 << 63;
+
+    #[inline]
+    fn partition(raw: &[u8], spill: &mut Spill, shards: usize) -> (Self, usize) {
+        // A nine-byte inline ID consists of a one-byte prefix and eight suffix
+        // bytes. For equal suffixes, XOR routes each distinct prefix to a
+        // different shard when the mask keeps at least seven bits. Shorter IDs
+        // use prefix zero. Comparisons inside the shard need only the suffix.
+        let compact = if shards >= 128 {
+            Self::suffix(raw)
+        } else {
+            InlineId::new(raw).map(|key| (Self(key.0), 0))
+        };
+        let (id, prefix) = compact.unwrap_or_else(|| (spill.push(raw), 0));
+        let shard = ((id.hash(spill) >> 32) as usize ^ prefix) & (shards - 1);
+        (id, shard)
+    }
+
+    #[inline]
+    fn suffix(raw: &[u8]) -> Option<(Self, usize)> {
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        let (prefix, bytes) = match raw {
+            [first, tail @ ..] if tail.len() == 8 && (1..128).contains(first) => (*first, tail),
+            short if short.len() <= 8 => (0, short),
+            _ => return None,
+        };
+        if let Ok(full) = <[u8; 8]>::try_from(bytes) {
+            let word = u64::from_le_bytes(full);
+            let zeros = word.wrapping_sub(0x0101_0101_0101_0101) & !word;
+            return ((word | zeros) & HIGH == 0).then_some((Self(word), usize::from(prefix)));
+        }
+        let mut padded = [0u8; 8];
+        for (dst, &ch) in padded.iter_mut().zip(bytes) {
+            if !(1..128).contains(&ch) {
+                return None;
+            }
+            *dst = ch;
+        }
+        Some((Self(u64::from_le_bytes(padded)), 0))
+    }
 
     fn hash(self, spill: &Spill) -> u64 {
         if self.0 < Self::SPILL {
@@ -147,7 +239,7 @@ impl Ingest {
     }
 }
 
-// Keep uncommon event IDs in contiguous batch-owned storage so their input
+// Keep uncommon IDs in contiguous batch-owned storage so their input
 // mapping can be released. The ID stores the index of its starting offset.
 #[derive(Default)]
 struct Spill {
@@ -176,8 +268,8 @@ impl Spill {
 
 type Names = NameMap<Box<[u8]>>;
 
-// Linked shoppers have stable indices shared by every parser. Batch-local
-// unlinked indices follow that prefix until dedup routes the winning claim.
+// Linked shoppers occupy a fixed prefix. Each deduplication group numbers
+// its unlinked winners locally until routing translates them to global indices.
 fn unlinked_index(linked: u32, local: u32) -> u32 {
     let index = linked.checked_add(local).expect("shopper index overflow");
     assert_ne!(index, INVALID, "shopper index overflow");
@@ -186,14 +278,13 @@ fn unlinked_index(linked: u32, local: u32) -> u32 {
 
 struct Batch<T, S> {
     claims: Vec<Vec<Claim<T, S>>>,
-    names: Names,
     spill: Spill,
     extended: Vec<i64>,
 }
 
 struct Source {
-    // Both tables are read-only throughout deduplication.
-    people: Vec<u32>,
+    // Event IDs, long shopper aliases and extended ingests live until all
+    // winners referencing this parse batch have been resolved.
     spill: Spill,
     extended: Vec<i64>,
 }
@@ -219,27 +310,30 @@ pub fn partition<'a, T: Stamp, S: Sale>(
         .clamp(8, 4096)
         .next_power_of_two();
     let shopper_shards = (workers * 4).next_power_of_two().max(8);
+    let per_batch = batch_size(chunks.len(), workers);
     let batches: Vec<_> = chunks
-        .par_chunks(batch_size(chunks.len(), workers))
+        .into_par_iter()
+        .chunks(per_batch)
         .map(|group| {
             let mut claims = buckets(event_shards);
-            let mut names = Names::default();
             let mut spill = Spill::default();
+            let mut long_shoppers = HashTable::new();
             let mut extended = Vec::new();
             let mut dates = Timestamps::default();
             for chunk in group {
                 chunk.visit(|row| {
-                    let Some((raw_id, ingested, event)) =
-                        parse_event(input, dimensions, &mut names, &mut dates, row, base)
-                    else {
+                    let Some((raw_id, ingested, event)) = parse_event(
+                        input,
+                        dimensions,
+                        &mut spill,
+                        &mut long_shoppers,
+                        &mut dates,
+                        row,
+                        base,
+                    ) else {
                         return;
                     };
-                    let id = InlineId::new(raw_id)
-                        .map(|key| EventId(key.0))
-                        .unwrap_or_else(|| spill.push(raw_id));
-                    // Use middle hash bits here. The table inside the shard uses
-                    // the low bits for probing and the highest bits for tags.
-                    let shard = (id.hash(&spill) >> 32) as usize & (event_shards - 1);
+                    let (id, shard) = EventId::partition(raw_id, &mut spill, event_shards);
                     claims[shard].push(Claim {
                         id,
                         ingested: Ingest::encode(ingested, base, &mut extended),
@@ -249,27 +343,16 @@ pub fn partition<'a, T: Stamp, S: Sale>(
             }
             Ok(Batch {
                 claims,
-                names,
                 spill,
                 extended,
             })
         })
         .collect::<Result<_>>()?;
-    drop(chunks);
 
-    let mut people = Names::default();
     let mut sources = Vec::with_capacity(batches.len());
     let mut shards = buckets(event_shards);
     for (source, batch) in batches.into_iter().enumerate() {
-        let mut translations = vec![0; batch.names.len()];
-        for (key, local) in batch.names.short {
-            translations[local as usize] = unlinked_index(linked, people.intern_short(key));
-        }
-        for (alias, local) in batch.names.other {
-            translations[local as usize] = unlinked_index(linked, people.intern_other(&alias));
-        }
         sources.push(Source {
-            people: translations,
             spill: batch.spill,
             extended: batch.extended,
         });
@@ -279,17 +362,50 @@ pub fn partition<'a, T: Stamp, S: Sale>(
             }
         }
     }
-
-    // The alias table is complete. Click parsing and event deduplication can
-    // use the same pool independently, including when a shard finishes early.
+    // Share a local shopper dictionary across several disjoint event-ID shards.
+    // This bounds the number of dictionaries to merge after resolving winners.
+    let winners: Vec<_> = shards
+        .into_par_iter()
+        .chunks(batch_size(event_shards, workers))
+        .map(|group| {
+            let mut names = Names::default();
+            let mut events = Vec::new();
+            for parts in group {
+                deduplicate(parts, &sources, dimensions, base, &mut names, &mut events);
+            }
+            (names, events)
+        })
+        .collect();
+    drop(sources);
+    let mut people = Names::default();
+    let mut translated = Vec::with_capacity(winners.len());
+    for (names, events) in winners {
+        let mut translations = vec![0; names.len()];
+        for (key, local) in names.short {
+            translations[local as usize] = unlinked_index(linked, people.intern_short(key));
+        }
+        for (id, local) in names.other {
+            translations[local as usize] = unlinked_index(linked, people.intern_other(&id));
+        }
+        translated.push((translations, events));
+    }
+    // Only winning, valid events contribute unlinked shopper numbers. The
+    // completed dictionary is now available to routing and click parsing.
     let (routed, clicks) = rayon::join(
         move || {
-            let routed: Vec<_> = shards
+            translated
                 .into_par_iter()
-                .map(|parts| deduplicate(parts, &sources, shopper_shards, base, linked))
-                .collect();
-            drop(sources);
-            routed
+                .map(|(translations, events)| {
+                    let mut routed = buckets(shopper_shards);
+                    for mut event in events {
+                        if event.person >= linked {
+                            event.person = translations[(event.person - linked) as usize];
+                        }
+                        routed[event.person as usize & (shopper_shards - 1)].push(event);
+                    }
+                    routed
+                })
+                .collect::<Vec<_>>()
         },
         || {
             let click_chunks = input.click_chunks();
@@ -344,10 +460,11 @@ struct Position {
 fn deduplicate<T: Stamp, S: Sale>(
     mut parts: Vec<ClaimPart<T, S>>,
     sources: &[Source],
-    shopper_shards: usize,
+    dimensions: &Dimensions<'_>,
     base: i64,
-    linked: u32,
-) -> Vec<Vec<Event<T, S>>> {
+    names: &mut Names,
+    events: &mut Vec<Event<T, S>>,
+) {
     let count = parts.iter().map(|p| p.rows.len()).sum();
     let mut winners = HashTable::<Position>::with_capacity(count);
     for p in 0..parts.len() {
@@ -400,26 +517,23 @@ fn deduplicate<T: Stamp, S: Sale>(
                     };
                     parts[loser.part as usize].rows[loser.row as usize]
                         .event
-                        .person = INVALID;
+                        .person = ShopperKey::INVALID;
                 }
             }
         }
     }
     drop(winners);
-    let mut routed = buckets(shopper_shards);
     for part in parts {
-        let people = &sources[part.source].people;
+        let spill = &sources[part.source].spill;
         for claim in part.rows {
-            let mut event = claim.event;
-            if event.person != INVALID {
-                if event.person >= linked {
-                    event.person = people[(event.person - linked) as usize];
-                }
-                routed[event.person as usize & (shopper_shards - 1)].push(event);
+            if let Some(person) = claim.event.person.resolve(spill, dimensions, names) {
+                events.push(Event {
+                    person,
+                    activity: claim.event.activity,
+                });
             }
         }
     }
-    routed
 }
 
 fn batch_size(chunks: usize, workers: usize) -> usize {
@@ -445,11 +559,12 @@ fn transpose<T>(batches: Vec<Vec<Vec<T>>>, count: usize) -> Vec<Vec<Vec<T>>> {
 fn parse_event<'a, T: Stamp, S: Sale>(
     input: &Input,
     dimensions: &Dimensions<'a>,
-    names: &mut Names,
+    spill: &mut Spill,
+    long_shoppers: &mut HashTable<EventId>,
     dates: &mut Timestamps,
     row: [Id<'a>; 7],
     base: i64,
-) -> Option<(Id<'a>, i64, Event<T, S>)> {
+) -> Option<(Id<'a>, i64, Event<T, S, ShopperKey>)> {
     let [id, user, ts, ingest, kind, product, price] = row;
     if id.is_empty() {
         return None;
@@ -479,17 +594,7 @@ fn parse_event<'a, T: Stamp, S: Sale>(
         } else {
             0
         };
-        let short = InlineId::new(user);
-        let person = dimensions
-            .people
-            .aliases
-            .get(user, short)
-            .unwrap_or_else(|| {
-                unlinked_index(
-                    dimensions.people.names.len() as u32,
-                    names.intern(user, short),
-                )
-            });
+        let person = ShopperKey::new(user, spill, long_shoppers);
         Some(Event {
             person,
             activity: Activity {
@@ -499,7 +604,7 @@ fn parse_event<'a, T: Stamp, S: Sale>(
         })
     })()
     .unwrap_or(Event {
-        person: INVALID,
+        person: ShopperKey::INVALID,
         ..Event::default()
     });
     Some((id, ingested, event))
@@ -543,8 +648,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_long_shoppers_share_their_spill_across_interleaved_events() {
+        let mut spill = Spill::default();
+        let mut seen = HashTable::new();
+        let raw = b"long-shopper-\x00-name";
+        let first = ShopperKey::new(raw, &mut spill, &mut seen);
+        spill.push(b"an unrelated long event id");
+        for i in 0..128 {
+            ShopperKey::new(
+                format!("another-long-user-{i}").as_bytes(),
+                &mut spill,
+                &mut seen,
+            );
+        }
+        assert!(first == ShopperKey::new(raw, &mut spill, &mut seen));
+        assert_eq!(seen.len(), 129);
+        assert_eq!(spill.starts.len(), 130);
+        assert_eq!(spill.get(EventId(first.0)), raw);
+    }
+
+    #[test]
+    fn event_suffix_and_shard_together_preserve_identity() {
+        use std::collections::HashSet;
+        let mut ids = vec![b"12345678".to_vec()];
+        for prefix in 1..128 {
+            let mut id = vec![prefix];
+            id.extend_from_slice(b"12345678");
+            ids.push(id);
+        }
+        ids.extend([b"1".to_vec(), b"12".to_vec(), b"1234567".to_vec()]);
+        for shards in [128, 256, 4096] {
+            let mut seen = HashSet::new();
+            for raw in &ids {
+                let (id, shard) = EventId::partition(raw, &mut Spill::default(), shards);
+                assert!(id.0 < EventId::SPILL);
+                assert!(seen.insert((id.0, shard)));
+            }
+        }
+        for raw in [
+            b"\x0012345678".as_slice(),
+            b"x1234\x000678",
+            b"12345678\xff",
+            b"0123456789",
+        ] {
+            let mut spill = Spill::default();
+            let (id, _) = EventId::partition(raw, &mut spill, 128);
+            assert_eq!(spill.get(id), raw);
+        }
+    }
+
+    #[test]
     fn compact_layout() {
-        assert_eq!(size_of::<Claim<u32, u32>>(), 24);
+        assert_eq!(size_of::<Claim<u32, u32>>(), 32);
         assert_eq!(size_of::<Event<u32, u32>>(), 12);
         assert_eq!(size_of::<Activity<u32, u32>>(), 8);
         assert_eq!(size_of::<Position>(), 8);
